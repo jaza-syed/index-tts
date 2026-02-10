@@ -656,13 +656,14 @@ class IndexTTS:
         self._set_gr_progress(0.9, "saving audio...")
         wav = torch.cat(wavs, dim=1)
         wav_length = wav.shape[-1] / sampling_rate
-        print(f">> Reference audio length: {cond_mel_frame * 256 / sampling_rate:.2f} seconds")
-        print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
-        print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
-        print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
-        print(f">> Total inference time: {end_time - start_time:.2f} seconds")
-        print(f">> Generated audio length: {wav_length:.2f} seconds")
-        print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
+        if verbose:
+            print(f">> Reference audio length: {cond_mel_frame * 256 / sampling_rate:.2f} seconds")
+            print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
+            print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
+            print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
+            print(f">> Total inference time: {end_time - start_time:.2f} seconds")
+            print(f">> Generated audio length: {wav_length:.2f} seconds")
+            print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
 
         # save audio
         wav = wav.cpu()  # to cpu
