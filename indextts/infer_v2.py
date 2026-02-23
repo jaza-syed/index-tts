@@ -9,6 +9,7 @@ import librosa
 import torch
 import torchaudio
 from torch.nn.utils.rnn import pad_sequence
+from tqdm import tqdm
 
 import warnings
 
@@ -352,6 +353,46 @@ class IndexTTS2:
             emo_vector = [vec * scale_factor for vec in emo_vector]
 
         return emo_vector
+
+    @torch.no_grad()
+    def get_audio_emotion_vector(self, audio_path: str) -> dict[str, float]:
+        """Extract 8-dim emotion decomposition from audio.
+
+        Computes cosine similarity between the audio's learned emotion
+        embedding and each of the 8 speaker-matched emotion basis vectors.
+
+        Returns:
+            Dict mapping emotion name to cosine similarity.
+        """
+        emotion_names = ["happy", "angry", "sad", "afraid", "disgusted", "melancholic", "surprised", "calm"]
+
+        audio_raw, sr = self._load_and_cut_audio(audio_path, 15, verbose=False)
+        audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio_raw)
+
+        # Emotion embedding via SeamlessM4T → Conformer → Perceiver → Linear
+        inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+        input_features = inputs["input_features"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
+        cond_emb = self.get_emb(input_features, attention_mask)
+        emovec = self.gpt.get_emovec(
+            cond_emb,
+            torch.tensor([cond_emb.shape[-1]], device=self.device),
+        )  # (1, model_dim)
+
+        # Speaker style (CAM++) for emotion basis matching
+        feat = torchaudio.compliance.kaldi.fbank(
+            audio_16k.to(self.device), num_mel_bins=80, dither=0, sample_frequency=16000,
+        )
+        feat = feat - feat.mean(dim=0, keepdim=True)
+        style = self.campplus_model(feat.unsqueeze(0))
+
+        # Find speaker-matched emotion basis vectors
+        indices = [find_most_similar_cosine(style, tmp) for tmp in self.spk_matrix]
+        basis_vecs = torch.stack([tmp[idx] for idx, tmp in zip(indices, self.emo_matrix)])  # (8, model_dim)
+
+        # Cosine similarity
+        sims = F.cosine_similarity(emovec.squeeze(0).unsqueeze(0), basis_vecs)  # (8,)
+        return {name: sims[i].item() for i, name in enumerate(emotion_names)}
 
     # 原始推理模式
     def infer(self, spk_audio_prompt, text, output_path,
@@ -707,6 +748,348 @@ class IndexTTS2:
             wav_data = wav.type(torch.int16)
             wav_data = wav_data.numpy().T
             yield (sampling_rate, wav_data)
+
+
+    def pad_tokens_cat(self, tokens: list[torch.Tensor]) -> torch.Tensor:
+        # [1, N] -> [N,]
+        tokens = [t.squeeze(0) for t in tokens]
+        return pad_sequence(tokens, batch_first=True,
+                            padding_value=self.cfg.gpt.stop_text_token,
+                            padding_side="right")
+
+    def bucket_utterances(self, items: list[dict], bucket_max_size: int = 4) -> list[list[dict]]:
+        """Group utterance dicts by token length for efficient batching.
+
+        Each item must have a ``"token_len"`` key.
+        If ``bucket_max_size <= 1``, returns all items in one bucket.
+        """
+        if len(items) <= bucket_max_size:
+            return [items]
+
+        factor = 1.5
+        buckets: list[list[dict]] = []
+        last_bucket: list[dict] | None = None
+        last_median = 0
+
+        for item in sorted(items, key=lambda x: x["token_len"]):
+            cur_len = item["token_len"]
+            if cur_len == 0:
+                continue
+            if (last_bucket is None
+                    or cur_len >= int(last_median * factor)
+                    or len(last_bucket) >= bucket_max_size):
+                buckets.append([item])
+                last_bucket = buckets[-1]
+                last_median = cur_len
+            else:
+                last_bucket.append(item)
+                mid = len(last_bucket) // 2
+                last_median = last_bucket[mid]["token_len"]
+        last_bucket = None
+
+        # merge size-1 buckets
+        out_buckets: list[list[dict]] = []
+        only_ones: list[dict] = []
+        for b in buckets:
+            if len(b) == 1:
+                only_ones.append(b[0])
+            else:
+                out_buckets.append(b)
+        if only_ones:
+            for b in out_buckets:
+                if len(b) < bucket_max_size:
+                    b.append(only_ones.pop(0))
+                    if not only_ones:
+                        break
+            if only_ones:
+                out_buckets.extend(
+                    [only_ones[i:i + bucket_max_size]
+                     for i in range(0, len(only_ones), bucket_max_size)])
+        return out_buckets
+
+    @torch.no_grad()
+    def infer_batch(
+        self,
+        spk_audio_prompt: str,
+        utterances: list[dict],
+        bucket_max_size: int = 4,
+        max_text_tokens_per_segment: int = 120,
+        interval_silence: int = 200,
+        verbose: bool = False,
+        **generation_kwargs,
+    ) -> list[str | None]:
+        """Batch inference for multiple utterances sharing the same speaker.
+
+        Each utterance dict must have keys ``text``, ``output_path`` and may
+        optionally include ``emo_audio_prompt``, ``emo_alpha``, ``emo_vector``.
+
+        Returns a list of output paths (or ``None`` on failure) aligned with
+        the input *utterances* list.
+        """
+        if not utterances:
+            return []
+
+        sampling_rate = 22050
+        do_sample = generation_kwargs.pop("do_sample", True)
+        top_p = generation_kwargs.pop("top_p", 0.8)
+        top_k = generation_kwargs.pop("top_k", 30)
+        temperature = generation_kwargs.pop("temperature", 0.8)
+        length_penalty = generation_kwargs.pop("length_penalty", 0.0)
+        num_beams = generation_kwargs.pop("num_beams", 3)
+        repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
+        max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
+
+        # ── Phase A: Speaker conditioning (computed once) ──────────────
+        if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
+            if self.cache_spk_cond is not None:
+                self.cache_spk_cond = None
+                self.cache_s2mel_style = None
+                self.cache_s2mel_prompt = None
+                self.cache_mel = None
+                torch.cuda.empty_cache()
+            audio, sr = self._load_and_cut_audio(spk_audio_prompt, 15, verbose)
+            audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
+            audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
+
+            inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+            input_features = inputs["input_features"].to(self.device)
+            attention_mask = inputs["attention_mask"].to(self.device)
+            spk_cond_emb = self.get_emb(input_features, attention_mask)
+
+            _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+            ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
+            ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+            feat = torchaudio.compliance.kaldi.fbank(
+                audio_16k.to(ref_mel.device), num_mel_bins=80, dither=0, sample_frequency=16000)
+            feat = feat - feat.mean(dim=0, keepdim=True)
+            style = self.campplus_model(feat.unsqueeze(0))
+
+            prompt_condition = self.s2mel.models['length_regulator'](
+                S_ref, ylens=ref_target_lengths, n_quantizers=3, f0=None)[0]
+
+            self.cache_spk_cond = spk_cond_emb
+            self.cache_s2mel_style = style
+            self.cache_s2mel_prompt = prompt_condition
+            self.cache_spk_audio_prompt = spk_audio_prompt
+            self.cache_mel = ref_mel
+        else:
+            spk_cond_emb = self.cache_spk_cond
+            style = self.cache_s2mel_style
+            prompt_condition = self.cache_s2mel_prompt
+            ref_mel = self.cache_mel
+
+        # ── Phase B: Lightweight tokenization (CPU only, no GPU tensors) ─
+        utt_items: list[dict] = []
+        for utt_idx, utt in enumerate(utterances):
+            emo_audio_prompt = utt.get("emo_audio_prompt")
+            emo_alpha = utt.get("emo_alpha", 1.0)
+            emo_vector = utt.get("emo_vector")
+
+            if emo_vector is not None:
+                emo_audio_prompt = None
+            if emo_audio_prompt is None:
+                emo_audio_prompt = spk_audio_prompt
+                emo_alpha = 1.0
+
+            # Tokenize text (CPU)
+            text = utt["text"]
+            text_tokens_list = self.tokenizer.tokenize(text)
+            segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment)
+            if len(segments) > 1 and verbose:
+                print(f"  >> Warning: utterance {utt_idx} text was split into {len(segments)} segments, using first only")
+
+            text_token_ids = self.tokenizer.convert_tokens_to_ids(segments[0])
+
+            utt_items.append({
+                "utt_idx": utt_idx,
+                "text_token_ids": text_token_ids,
+                "token_len": len(text_token_ids),
+                "output_path": utt["output_path"],
+                "emo_audio_prompt": emo_audio_prompt,
+                "emo_alpha": emo_alpha,
+                "emo_vector": emo_vector,
+            })
+
+        # ── Phase C: Bucket utterances by token length ─────────────────
+        buckets = self.bucket_utterances(utt_items, bucket_max_size=bucket_max_size)
+        if verbose:
+            print(f">> {len(utt_items)} utterances -> {len(buckets)} buckets, "
+                  f"sizes: {[len(b) for b in buckets]}")
+
+        # ── Phase D+E: Per-bucket JIT emotion + GPT + vocoder ─────────
+        results: dict[int, str | None] = {}
+        pbar = tqdm(total=len(utt_items), desc=spk_audio_prompt)
+        for bucket in buckets:
+            B = len(bucket)
+
+            # D1: Compute emovec & emo_cond_emb just-in-time for this bucket
+            for item in bucket:
+                emo_audio_prompt = item["emo_audio_prompt"]
+                emo_alpha = item["emo_alpha"]
+                emo_vector = item["emo_vector"]
+
+                # Compute emo_cond_emb (uses cache)
+                if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
+                    if self.cache_emo_cond is not None:
+                        self.cache_emo_cond = None
+                        torch.cuda.empty_cache()
+                    emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt, 15, verbose, sr=16000)
+                    emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+                    emo_cond_emb = self.get_emb(
+                        emo_inputs["input_features"].to(self.device),
+                        emo_inputs["attention_mask"].to(self.device))
+                    self.cache_emo_cond = emo_cond_emb
+                    self.cache_emo_audio_prompt = emo_audio_prompt
+                else:
+                    emo_cond_emb = self.cache_emo_cond
+
+                with torch.amp.autocast(self.device, enabled=self.dtype is not None, dtype=self.dtype):
+                    emovec = self.gpt.merge_emovec(
+                        spk_cond_emb, emo_cond_emb,
+                        torch.tensor([spk_cond_emb.shape[-1]], device=self.device),
+                        torch.tensor([emo_cond_emb.shape[-1]], device=self.device),
+                        alpha=emo_alpha)
+
+                    if emo_vector is not None:
+                        weight_vector = torch.tensor(emo_vector, device=self.device)
+                        random_index = [find_most_similar_cosine(style, tmp) for tmp in self.spk_matrix]
+                        emo_matrix = torch.cat(
+                            [tmp[idx].unsqueeze(0) for idx, tmp in zip(random_index, self.emo_matrix)], 0)
+                        emovec_mat = torch.sum(weight_vector.unsqueeze(1) * emo_matrix, 0).unsqueeze(0)
+                        emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec
+
+                item["emovec"] = emovec
+                item["emo_cond_emb"] = emo_cond_emb
+                item["text_tokens"] = torch.tensor(
+                    item["text_token_ids"], dtype=torch.int32, device=self.device).unsqueeze(0)
+
+            # D2: Batched GPT generation
+            batch_text = self.pad_tokens_cat([it["text_tokens"] for it in bucket])
+            batch_emovec = torch.cat([it["emovec"] for it in bucket], dim=0)  # (B, dim)
+            batch_spk = spk_cond_emb.expand(B, -1, -1)
+
+            with torch.amp.autocast(self.device, enabled=self.dtype is not None, dtype=self.dtype):
+                codes, speech_conditioning_latent = self.gpt.inference_speech(
+                    batch_spk, batch_text,
+                    emo_vec=batch_emovec,
+                    cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=self.device),
+                    emo_cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=self.device),
+                    do_sample=do_sample, top_p=top_p, top_k=top_k,
+                    temperature=temperature, num_return_sequences=1,
+                    length_penalty=length_penalty, num_beams=num_beams,
+                    repetition_penalty=repetition_penalty,
+                    max_generate_length=max_mel_tokens,
+                    **generation_kwargs)
+
+            for i, item in enumerate(bucket):
+                item["codes"] = codes[i:i+1]
+                item["speech_conditioning_latent"] = speech_conditioning_latent[i:i+1]
+
+            # E1: GPT latent extraction (per-utterance, each has own emo_cond_emb/emovec)
+            latents = []
+            all_codes = []
+            all_code_lens = []
+            for item in bucket:
+                c = item["codes"]
+                c, c_lens = self.remove_long_silence(c, silent_token=52, max_consecutive=30)
+                item["code_lens"] = c_lens
+                all_codes.append(c)
+                all_code_lens.append(c_lens)
+
+                tt = item["text_tokens"]
+                use_speed = torch.zeros(1, device=self.device).long()
+                with torch.amp.autocast(self.device, enabled=self.dtype is not None, dtype=self.dtype):
+                    latent = self.gpt(
+                        item["speech_conditioning_latent"], tt,
+                        torch.tensor([tt.shape[-1]], device=self.device),
+                        c, torch.tensor([c.shape[-1]], device=self.device),
+                        item["emo_cond_emb"],
+                        cond_mel_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=self.device),
+                        emo_cond_mel_lengths=torch.tensor([item["emo_cond_emb"].shape[-1]], device=self.device),
+                        emo_vec=item["emovec"], use_speed=use_speed)
+                latents.append(latent)
+
+            # E2: Batched semantic codec + length regulator + CFM + BigVGAN
+            with torch.amp.autocast(self.device, enabled=False):
+                conds = []
+                target_lens = []
+                for idx_in_bucket, item in enumerate(bucket):
+                    c = all_codes[idx_in_bucket]
+                    c_lens = all_code_lens[idx_in_bucket]
+                    lat = latents[idx_in_bucket]
+
+                    gpt_lat = self.s2mel.models['gpt_layer'](lat)
+                    S_infer = self.semantic_codec.quantizer.vq2emb(c.unsqueeze(1)).transpose(1, 2)
+                    S_infer = S_infer + gpt_lat
+                    tgt_len = (c_lens * 1.72).long()
+                    target_lens.append(tgt_len)
+
+                    cond = self.s2mel.models['length_regulator'](
+                        S_infer, ylens=tgt_len, n_quantizers=3, f0=None)[0]
+                    cat_cond = torch.cat([prompt_condition, cond], dim=1)
+                    conds.append(cat_cond)
+
+                max_cond_len = max(c.shape[1] for c in conds)
+                padded_conds = []
+                cond_lens_list = []
+                for c in conds:
+                    cond_lens_list.append(c.shape[1])
+                    pad_len = max_cond_len - c.shape[1]
+                    if pad_len > 0:
+                        padded_conds.append(F.pad(c, (0, 0, 0, pad_len)))
+                    else:
+                        padded_conds.append(c)
+                batch_mu = torch.cat(padded_conds, dim=0)  # (B, max_T, C)
+                batch_x_lens = torch.LongTensor(cond_lens_list).to(self.device)
+
+                batch_ref_mel = ref_mel.expand(B, -1, -1)
+                batch_style = style.expand(B, -1)
+
+                diffusion_steps = 25
+                inference_cfg_rate = 0.7
+
+                vc_target = self.s2mel.models['cfm'].inference(
+                    batch_mu, batch_x_lens, batch_ref_mel, batch_style, None,
+                    diffusion_steps, inference_cfg_rate=inference_cfg_rate)
+
+                vc_target = vc_target[:, :, ref_mel.size(-1):]
+
+                wavs_batch = self.bigvgan(vc_target.float())  # (B, 1, samples)
+
+            # Save per-utterance and free intermediate tensors
+            for i, item in enumerate(bucket):
+                actual_mel_len = cond_lens_list[i] - prompt_condition.shape[1]
+                actual_samples = actual_mel_len * 256  # hop_size = 256
+                wav = wavs_batch[i:i+1, :, :actual_samples]
+                wav = wav.squeeze(0)  # (1, samples)
+                wav = torch.clamp(32767 * wav, -32767.0, 32767.0).cpu()
+
+                output_path = item["output_path"]
+                try:
+                    if os.path.isfile(output_path):
+                        os.remove(output_path)
+                    if os.path.dirname(output_path) != "":
+                        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
+                    results[item["utt_idx"]] = output_path
+                except Exception as e:
+                    if verbose:
+                        print(f"  >> Failed to save {output_path}: {e}")
+                    results[item["utt_idx"]] = None
+
+            # Free per-bucket GPU tensors
+            for item in bucket:
+                item.pop("emovec", None)
+                item.pop("emo_cond_emb", None)
+                item.pop("text_tokens", None)
+                item.pop("codes", None)
+                item.pop("speech_conditioning_latent", None)
+            del latents, all_codes, all_code_lens, conds, padded_conds, wavs_batch
+            torch.cuda.empty_cache()
+            pbar.update(B)
+
+        pbar.close()
+        return [results.get(i) for i in range(len(utterances))]
 
 
 def find_most_similar_cosine(query_vector, matrix):
